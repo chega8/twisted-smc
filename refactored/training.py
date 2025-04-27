@@ -72,6 +72,17 @@ def compute_binary_cross_entropy_loss(logits, targets, logger=None):
     
     return loss
 
+def calculate_CTL_loss(rewards, particles, log_psi_record, device):
+    """Build CTL loss"""
+    baseline = rewards.mean() 
+    loss = torch.tensor(0.0, device=device)
+    for k in range(len(particles)):
+        # sum_{t} log psi_t for particle k   (already a list of scalars)
+        logsum = torch.stack(log_psi_record[k]).sum()
+        loss += -(rewards[k] - baseline) * logsum
+    loss = loss / len(particles)
+    return loss
+
 def train_twist_for_math_problems(
     model_name: str,
     num_examples: int = 10,
@@ -145,14 +156,15 @@ def train_twist_for_math_problems(
                 logger.debug(f"Prompt tokens shape: {prompt_tokens.shape}")
             
             # Generate samples using SMC
-            particles, weights = smc_proposal_sampling(
+            particles, weights, log_psi_record = smc_proposal_sampling(
                 prompt_tokens[0].tolist(),
                 model.get_base_model_logits_for_sequence,
                 model.get_twist_values_for_particles,
                 num_twist_samples,
                 output_length,
                 device,
-                logger
+                logger,
+                record_log_psi=True 
             )
             
             if logger:
@@ -176,10 +188,13 @@ def train_twist_for_math_problems(
                 logger.debug(f"Rewards: {rewards.tolist()}")
             
             # Compute loss
-            loss = compute_binary_cross_entropy_loss(weights, rewards, logger)
+            # loss = compute_binary_cross_entropy_loss(weights, rewards, logger)
+
+            loss = calculate_CTL_loss(rewards, particles, log_psi_record, device)
             
             if logger:
-                logger.info(f"Loss: {loss.item():.4f}")
+                # logger.info(f"Loss: {loss.item():.4f}")
+                logger.info(f"CTL loss: {loss.item():.4f}  |  rewards: {rewards.tolist()}")
             
             # Backward pass
             optimizer.zero_grad()

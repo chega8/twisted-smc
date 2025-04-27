@@ -3,6 +3,16 @@ import re
 import numpy as np
 import time
 
+def format_reward(response, logger=None):
+    boxed_match = re.search(r'\\boxed\{([^}]+)\}', response)
+    if boxed_match:
+        if logger:
+            logger.debug(f"Found \\boxed")
+        return 1
+    if logger:
+        logger.warning("No \\boxed found in response")
+    return 0
+
 def extract_answer_from_response(response, logger=None):
     """
     Extract the boxed answer from the model's response.
@@ -26,12 +36,12 @@ def extract_answer_from_response(response, logger=None):
         return answer
     
     # If no boxed answer, try to find the last number in the response
-    numbers = re.findall(r'[-+]?\d*\.\d+|\d+', response)
-    if numbers:
-        answer = numbers[-1]
-        if logger:
-            logger.debug(f"Found number answer: {answer}")
-        return answer
+    # numbers = re.findall(r'[-+]?\d*\.\d+|\d+', response)
+    # if numbers:
+    #     answer = numbers[-1]
+    #     if logger:
+    #         logger.debug(f"Found number answer: {answer}")
+    #     return answer
     
     if logger:
         logger.warning("No answer found in response")
@@ -68,6 +78,12 @@ def is_correct_answer(predicted, actual, logger=None):
         if logger:
             logger.debug(f"String comparison: '{predicted.strip()}' vs '{actual.strip()}', is_correct={is_correct}")
         return is_correct
+    
+def parse_correct_answer(correct_answer_txt: str):
+    numbers = re.findall(r'[-+]?\d*\.\d+|\d+', correct_answer_txt)
+    if numbers:
+        answer = numbers[-1]
+        return answer
 
 def calculate_reward(sample_text, correct_answer, tokenizer=None, logger=None):
     """
@@ -82,15 +98,17 @@ def calculate_reward(sample_text, correct_answer, tokenizer=None, logger=None):
     Returns:
         Reward value between 0 and 1
     """
+    correct_answer_val = parse_correct_answer(correct_answer)
     if logger:
         logger.debug(f"Calculating reward for sample: {sample_text}")
-        logger.debug(f"Correct answer: {correct_answer}")
+        logger.debug(f"Correct answer: {correct_answer_val}")
     
     # Initialize reward components
     reward_components = {
         'exact_match': 0.0,
-        'partial_match': 0.0,
-        'numerical_match': 0.0,
+        'format_match': 0.0,
+        # 'partial_match': 0.0,
+        # 'numerical_match': 0.0,
         'length_penalty': 0.0
     }
     
@@ -100,7 +118,7 @@ def calculate_reward(sample_text, correct_answer, tokenizer=None, logger=None):
         
         # Calculate exact match reward
         if extracted_answer is not None:
-            if is_correct_answer(extracted_answer, correct_answer, logger):
+            if is_correct_answer(extracted_answer, correct_answer_val, logger):
                 reward_components['exact_match'] = 1.0
                 if logger:
                     logger.debug("Exact match reward: 1.0")
@@ -112,42 +130,44 @@ def calculate_reward(sample_text, correct_answer, tokenizer=None, logger=None):
                 logger.debug("Exact match reward: 0.0 (no answer extracted)")
         
         # Calculate partial match reward if tokenizer is provided
-        if tokenizer is not None:
-            # Tokenize sample and answer
-            sample_tokens = tokenizer.encode(sample_text)
-            answer_tokens = tokenizer.encode(correct_answer)
-            
-            if len(sample_tokens) > 0 and len(answer_tokens) > 0:
-                common_tokens = set(sample_tokens) & set(answer_tokens)
-                if len(common_tokens) > 0:
-                    reward_components['partial_match'] = len(common_tokens) / max(len(sample_tokens), len(answer_tokens))
-                    if logger:
-                        logger.debug(f"Partial match reward: {reward_components['partial_match']}")
+        if 'partial_match' in reward_components.keys():
+            if tokenizer is not None:
+                # Tokenize sample and answer
+                sample_tokens = tokenizer.encode(sample_text)
+                answer_tokens = tokenizer.encode(correct_answer_val)
+                
+                if len(sample_tokens) > 0 and len(answer_tokens) > 0:
+                    common_tokens = set(sample_tokens) & set(answer_tokens)
+                    if len(common_tokens) > 0:
+                        reward_components['partial_match'] = len(common_tokens) / max(len(sample_tokens), len(answer_tokens))
+                        if logger:
+                            logger.debug(f"Partial match reward: {reward_components['partial_match']}")
+                    else:
+                        if logger:
+                            logger.debug("Partial match reward: 0.0 (no common tokens)")
                 else:
                     if logger:
-                        logger.debug("Partial match reward: 0.0 (no common tokens)")
-            else:
-                if logger:
-                    logger.debug("Partial match reward: 0.0 (empty token lists)")
+                        logger.debug("Partial match reward: 0.0 (empty token lists)")
         
         # Calculate numerical match reward
-        sample_numbers = [float(token) for token in sample_text.split() if token.replace('.', '').isdigit()]
-        answer_numbers = [float(token) for token in correct_answer.split() if token.replace('.', '').isdigit()]
-        
-        if sample_numbers and answer_numbers:
-            sample_sum = sum(sample_numbers)
-            answer_sum = sum(answer_numbers)
-            if abs(sample_sum - answer_sum) < 1e-6:
-                reward_components['numerical_match'] = 1.0
-                if logger:
-                    logger.debug(f"Numerical match reward: 1.0 (sums match: {sample_sum} = {answer_sum})")
+        if 'numerical_match' in reward_components.keys():
+            sample_numbers = [float(token) for token in sample_text.split() if token.replace('.', '').isdigit()]
+            answer_numbers = [float(token) for token in correct_answer_val.split() if token.replace('.', '').isdigit()]
+            
+            if sample_numbers and answer_numbers:
+                sample_sum = sum(sample_numbers)
+                answer_sum = sum(answer_numbers)
+                if abs(sample_sum - answer_sum) < 1e-6:
+                    reward_components['numerical_match'] = 1.0
+                    if logger:
+                        logger.debug(f"Numerical match reward: 1.0 (sums match: {sample_sum} = {answer_sum})")
+                else:
+                    reward_components['numerical_match'] = 1.0 - min(1.0, abs(sample_sum - answer_sum) / max(abs(sample_sum), abs(answer_sum)))
+                    if logger:
+                        logger.debug(f"Numerical match reward: {reward_components['numerical_match']} (sums differ: {sample_sum} != {answer_sum})")
             else:
-                reward_components['numerical_match'] = 1.0 - min(1.0, abs(sample_sum - answer_sum) / max(abs(sample_sum), abs(answer_sum)))
                 if logger:
-                    logger.debug(f"Numerical match reward: {reward_components['numerical_match']} (sums differ: {sample_sum} != {answer_sum})")
-        else:
-            if logger:
-                logger.debug("Numerical match reward: 0.0 (no numbers found)")
+                    logger.debug("Numerical match reward: 0.0 (no numbers found)")
         
         # Calculate length penalty if tokenizer is provided
         if tokenizer is not None:
@@ -162,12 +182,17 @@ def calculate_reward(sample_text, correct_answer, tokenizer=None, logger=None):
             else:
                 if logger:
                     logger.debug("Length penalty: 0.0 (empty token lists)")
-        
+
+        format_reward_val = format_reward(sample_text)
+        reward_components['format_match'] = format_reward_val
+
         # Calculate total reward
         reward = sum(reward_components.values()) / len(reward_components)
         if logger:
             logger.debug(f"Total reward: {reward}")
             logger.debug(f"Reward components: {reward_components}")
+
+    
         
     except Exception as e:
         if logger:

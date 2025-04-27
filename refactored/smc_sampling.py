@@ -29,7 +29,7 @@ def initialize_particles(text_prompt, num_particles, device, logger=None):
 
     return particles, weights
 
-def sample_next_token(particles, model, twist, device, logger=None):
+def sample_next_token(particles, model, twist, device, logger=None, record_log_psi=False, log_psi_record=None):
     """
     Sample the next token for each particle using the base model and twist function.
     
@@ -87,10 +87,20 @@ def sample_next_token(particles, model, twist, device, logger=None):
     
     # Sample one token per particle from the categorical proposal.
     new_particles = []
+    step_log_psi = []
     for i in range(num_particles):
         token = torch.multinomial(proposal[i], 1)  # Sample one token.
         new_seq = particles[i] + [token.item()]
         new_particles.append(new_seq)
+        
+        if record_log_psi:                                 
+            log_psi_val = torch.log(
+                torch.clamp(psi[i, token], min=1e-8)
+            ).squeeze()          # scalar
+            step_log_psi.append(log_psi_val)
+            
+    if record_log_psi:                                     
+        log_psi_record.append(step_log_psi)
     
     if logger:
         logger.debug(f"Sampled next tokens, new particles length: {len(new_particles[0])}")
@@ -147,7 +157,7 @@ def resample_particles(particles, weights, device, logger=None):
     
     return resampled_particles, new_weights
 
-def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_count, device, logger=None):
+def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_count, device, logger=None, record_log_psi=False):
     """
     Perform SMC-PROPOSAL sampling starting from a given text prompt.
     
@@ -176,14 +186,18 @@ def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_c
     
     # Initialize particles with the text prompt.
     particles, weights = initialize_particles(text_prompt, num_particles, device, logger)
-    
+    if record_log_psi:
+        # outer list over time; each element filled inside sample_next_token
+        log_psi_record = []
+        
     # Generate new tokens sequentially.
     for t in range(new_tokens_count):
         if logger:
             logger.debug(f"Generating token {t+1}/{new_tokens_count}")
         
         # Sample the next token for each particle.
-        particles, norm_constants = sample_next_token(particles, model, twist, device, logger)
+        particles, norm_constants = sample_next_token(particles, model, twist, device, logger, record_log_psi=record_log_psi,     # NEW
+            log_psi_record=log_psi_record)
         
         # Update the weights by multiplying with the normalization constants.
         weights = weights * norm_constants
@@ -195,7 +209,14 @@ def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_c
                 logger.debug(f"ESS {ess.item():.2f} below threshold, resampling")
             particles, weights = resample_particles(particles, weights, device, logger)
     
+    if record_log_psi:
+        # transpose so that log_psi_record[k][t]  (particle k, step t)
+        log_psi_record = list(map(list, zip(*log_psi_record)))
+        
     if logger:
         logger.info(f"SMC sampling completed in {time.time() - start_time:.2f} seconds")
     
-    return particles, weights 
+    if record_log_psi:                           # NEW
+        return particles, weights, log_psi_record
+    else:
+        return particles, weights
