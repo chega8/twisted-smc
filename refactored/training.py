@@ -72,16 +72,16 @@ def compute_binary_cross_entropy_loss(logits, targets, logger=None):
     
     return loss
 
-def calculate_CTL_loss(rewards, particles, log_psi_record, device):
+def calculate_CTL_loss(rewards, weights, particles, log_psi_record, device):
     """Build CTL loss"""
     baseline = rewards.mean() 
     loss = torch.tensor(0.0, device=device)
+    norm_w = weights / weights.sum()
     for k in range(len(particles)):
         # sum_{t} log psi_t for particle k   (already a list of scalars)
         logsum = torch.stack(log_psi_record[k]).sum()
-        loss += -(rewards[k] - baseline) * logsum
+        loss += -norm_w[k] * (rewards[k] - baseline) * logsum
     loss = loss / len(particles)
-    return loss
 
 def train_twist_for_math_problems(
     model_name: str,
@@ -190,7 +190,7 @@ def train_twist_for_math_problems(
             # Compute loss
             # loss = compute_binary_cross_entropy_loss(weights, rewards, logger)
 
-            loss = calculate_CTL_loss(rewards, particles, log_psi_record, device)
+            loss = calculate_CTL_loss(rewards, weights, particles, log_psi_record, device)
             
             if logger:
                 # logger.info(f"Loss: {loss.item():.4f}")

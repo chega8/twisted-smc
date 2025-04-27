@@ -9,32 +9,19 @@ class TwistModel(nn.Module):
     A twist model that applies a linear transformation to token embeddings.
     This model is used to modify the probability distribution of the base model.
     """
-    def __init__(self, vocab_size, hidden_size=1):
+    def __init__(self, vocab_size, hidden_dim=64):
         super().__init__()
-        self.linear = nn.Linear(vocab_size, hidden_size)
+        self.embed = nn.Embedding(vocab_size, hidden_dim)
+        self.head  = nn.Linear(hidden_dim, vocab_size)   # → (B, V)
         
-    def forward(self, input_ids):
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
-        Apply the twist transformation to the input tokens.
-        
-        Args:
-            input_ids: Token IDs of shape (batch_size, seq_len)
-            
-        Returns:
-            Twist values of shape (batch_size, seq_len, hidden_size)
+        input_ids : (B, L)   – any length
+        returns   : (B, V)   – log-psi for EACH vocab token
         """
-        batch_size, seq_len = input_ids.shape
-        
-        # Create one-hot encodings for the input tokens
-        one_hot = torch.zeros(batch_size, seq_len, self.linear.in_features, device=input_ids.device)
-        for i in range(batch_size):
-            for j in range(seq_len):
-                one_hot[i, j, input_ids[i, j]] = 1.0
-        
-        # Apply linear transformation to each token
-        twist_values = self.linear(one_hot)
-        
-        return twist_values
+        last_ids = input_ids[:, -1]          # (B,)
+        h        = self.embed(last_ids)      # (B, hidden)
+        return self.head(h) 
 
 class ModelWrapper:
     def __init__(self, model_name, device=None, logger=None):
@@ -65,10 +52,13 @@ class ModelWrapper:
         for i, p in enumerate(particles):
             input_ids[i, :len(p)] = torch.tensor(p, device=self.device)
         
-        twist_values = self.twist_model(input_ids)
-        psi = twist_values[:, -1, 0].unsqueeze(-1).expand(-1, self.tokenizer.vocab_size)
-        return torch.exp(psi)
-        # return psi
+        # twist_values = self.twist_model(input_ids)
+        # psi = twist_values[:, -1, 0].unsqueeze(-1).expand(-1, self.tokenizer.vocab_size)
+        
+        # log ψ  (B, vocab)
+        log_psi = self.twist_model(input_ids)             
+        psi     = torch.exp(log_psi)
+        return psi  
     
     def save_state(self, path):
         """Save model state."""

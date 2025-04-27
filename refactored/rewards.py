@@ -242,37 +242,37 @@ def calculate_rewards_for_samples(samples, prompt, correct_answer, tokenizer, lo
     
     return rewards
 
-def log_true_final_twist(samples, prompt, correct_answer, tokenizer, logger=None):
-    """
-    Calculate log probabilities for the true final twist based on rewards.
+# def log_true_final_twist(samples, prompt, correct_answer, tokenizer, logger=None):
+#     """
+#     Calculate log probabilities for the true final twist based on rewards.
     
-    Args:
-        samples: Generated samples of shape (batch_size, seq_len)
-        prompt: Input prompt text
-        correct_answer: The correct answer
-        tokenizer: Tokenizer for decoding samples
-        logger: Optional logger instance
+#     Args:
+#         samples: Generated samples of shape (batch_size, seq_len)
+#         prompt: Input prompt text
+#         correct_answer: The correct answer
+#         tokenizer: Tokenizer for decoding samples
+#         logger: Optional logger instance
         
-    Returns:
-        Log probabilities of shape (batch_size,)
-    """
-    if logger:
-        logger.debug("Calculating log_true_final_twist")
-        logger.debug(f"Prompt: {prompt}")
-        logger.debug(f"Correct answer: {correct_answer}")
+#     Returns:
+#         Log probabilities of shape (batch_size,)
+#     """
+#     if logger:
+#         logger.debug("Calculating log_true_final_twist")
+#         logger.debug(f"Prompt: {prompt}")
+#         logger.debug(f"Correct answer: {correct_answer}")
     
-    start_time = time.time()
+#     start_time = time.time()
     
-    # Calculate rewards for each sample
-    rewards = calculate_rewards_for_samples(samples, prompt, correct_answer, tokenizer, logger)
+#     # Calculate rewards for each sample
+#     rewards = calculate_rewards_for_samples(samples, prompt, correct_answer, tokenizer, logger)
     
-    if logger:
-        logger.debug(f"Calculated rewards in {time.time() - start_time:.2f} seconds")
+#     if logger:
+#         logger.debug(f"Calculated rewards in {time.time() - start_time:.2f} seconds")
     
-    # Convert rewards to log probabilities using softmax
-    log_probs = torch.log_softmax(rewards, dim=0)
+#     # Convert rewards to log probabilities using softmax
+#     log_probs = torch.log_softmax(rewards, dim=0)
     
-    if logger:
-        logger.debug(f"Log probabilities: {log_probs}")
+#     if logger:
+#         logger.debug(f"Log probabilities: {log_probs}")
     
-    return log_probs 
+#     return log_probs 

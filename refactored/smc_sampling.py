@@ -155,7 +155,7 @@ def resample_particles(particles, weights, device, logger=None):
     if logger:
         logger.debug("Resampling complete")
     
-    return resampled_particles, new_weights
+    return resampled_particles, new_weights, indices
 
 def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_count, device, logger=None, record_log_psi=False):
     """
@@ -207,7 +207,9 @@ def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_c
         if ess < num_particles / 2:
             if logger:
                 logger.debug(f"ESS {ess.item():.2f} below threshold, resampling")
-            particles, weights = resample_particles(particles, weights, device, logger)
+            particles, weights, indices = resample_particles(particles, weights, device, logger)
+            if record_log_psi:
+                log_psi_record = [log_psi_record[i.item()] for i in indices]
     
     if record_log_psi:
         # transpose so that log_psi_record[k][t]  (particle k, step t)
