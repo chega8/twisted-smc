@@ -2,110 +2,210 @@ import torch
 import logging
 import time
 
-def initialize_particles(text_prompt, num_particles, device, logger=None):
-    """
-    Initialize particles from a given text prompt.
-    
-    Each particle is a copy of the provided prompt.
-    
-    Args:
-        text_prompt (list[int]): Initial sequence of token indices (e.g., from a text prompt).
-        num_particles (int): Number of particles to initialize.
-        device (torch.device): Device on which tensors will be allocated.
-        logger: Optional logger instance
-        
-    Returns:
-        particles (list[list[int]]): List containing num_particles copies of the text_prompt.
-        weights (torch.Tensor): Tensor of initial weights (all ones), shape (num_particles,).
-    """
-    if logger:
-        logger.debug(f"Initializing {num_particles} particles from prompt of length {len(text_prompt)}")
-    
-    particles = [list(text_prompt) for _ in range(num_particles)]
-    weights = torch.ones(num_particles, device=device)
-    
-    if logger:
-        logger.debug(f"Initialized particles and weights of shape {weights.shape}")
 
-    return particles, weights
+def incremental_weight_update(previous_weights, current_weights):
+    # assuming weights are in log space
+    # incremental weights should estimate Z_t/Z_{t-1}
+    incremental_weights = current_weights - previous_weights
+    return incremental_weights
 
-def sample_next_token(particles, model, twist, device, logger=None, record_log_psi=False, log_psi_record=None):
-    """
-    Sample the next token for each particle using the base model and twist function.
+
+def initialize_particles_and_state(text_prompt_tokens, num_particles, device):
+
+    if isinstance(text_prompt_tokens, torch.Tensor):
+        prompt_tensor = text_prompt_tokens.to(dtype=torch.long, device=device)
+        if prompt_tensor.ndim == 2 and prompt_tensor.shape[0] == 1:
+            prompt_tensor = prompt_tensor.squeeze(0)
+        elif prompt_tensor.ndim == 0:
+            prompt_tensor = prompt_tensor.unsqueeze(0)
+    else:
+        prompt_tensor = torch.tensor(text_prompt_tokens, dtype=torch.long, device=device)
+        if prompt_tensor.ndim == 0:
+            prompt_tensor = prompt_tensor.unsqueeze(0)
+        elif prompt_tensor.ndim == 2 and prompt_tensor.shape[0] == 1: # handle [1,N]
+            prompt_tensor = prompt_tensor.squeeze(0)
+
+    assert prompt_tensor.ndim == 1, f"Prompt tensor must be 1D after processing, got shape {prompt_tensor.shape}"
+
+    logger.debug(f"Initializing {num_particles} particles from prompt tensor of shape {prompt_tensor.shape}")
+    particle_sequences = prompt_tensor.unsqueeze(0).expand(num_particles, -1)
+    log_weights = torch.zeros(num_particles, device=device)
+    log_p_theta_cumulative = torch.zeros(num_particles, device=device)
+    log_psi_cumulative = torch.zeros(num_particles, device=device)
+    log_z_hat = torch.tensor(0.0, device=device)
+    logger.debug("Initialized particles and SMC states (log_weights, log_p_theta_cumulative, log_psi_cumulative, log_z_hat).")
+    return (
+        particle_sequences,
+        log_weights,
+        log_p_theta_cumulative,
+        log_psi_cumulative,
+        log_z_hat,
+    )
+
+
+def resample_particles_and_state(
+    particle_sequences,
+    log_weights,
+    log_p_theta_cumulative,
+    log_psi_cumulative,
+    device,
+    log_psi_record_for_resampling=None,
+    logger_instance=None,
+):
+    global logger
+    if logger_instance: logger = logger_instance
+
+    num_particles = particle_sequences.shape[0]
+    if num_particles == 0:
+        return (
+            particle_sequences,
+            log_weights,
+            log_p_theta_cumulative,
+            log_psi_cumulative,
+            log_psi_record_for_resampling,
+            torch.empty(0, dtype=torch.long, device=device)
+        )
+
+    logger.debug(f"Performing resampling for {num_particles} particles.")
+    probabilities = torch.softmax(log_weights, dim=0)
+    indices = torch.multinomial(probabilities, num_particles, replacement=True)
+
+    resampled_particle_sequences = particle_sequences[indices]
+    resampled_log_p_theta_cumulative = log_p_theta_cumulative[indices]
+    resampled_log_psi_cumulative = log_psi_cumulative[indices]
+
+    resampled_log_psi_record = None
+    if log_psi_record_for_resampling is not None:
+        if isinstance(log_psi_record_for_resampling, list) and all(isinstance(el, list) for el in log_psi_record_for_resampling):
+            resampled_log_psi_record = [log_psi_record_for_resampling[i.item()] for i in indices]
+        # Add handling if it's a tensor
+        elif isinstance(log_psi_record_for_resampling, torch.Tensor) and log_psi_record_for_resampling.ndim >= 1:
+            resampled_log_psi_record = log_psi_record_for_resampling[indices]
+
+    new_log_weights = torch.zeros(num_particles, device=device)
+    logger.debug("Resampling complete. Log_weights reset.")
+    return (
+        resampled_particle_sequences,
+        new_log_weights,
+        resampled_log_p_theta_cumulative,
+        resampled_log_psi_cumulative,
+        resampled_log_psi_record,
+        indices
+    )
+
+
+def smc_proposal_sampling(
+    text_prompt_tokens,
+    model_forward_fn,
+    twist_forward_fn,
+    num_particles,
+    new_tokens_count,
+    device,
+    logger_instance=None,
+    record_log_psi_incrementals=False,
+):
+    global logger
+    if logger_instance: logger = logger_instance
+
+    logger.info(f"Starting SMC sampling with {num_particles} particles for {new_tokens_count} new tokens.")
+    start_time = time.time()
+
+    (
+        current_particle_sequences,
+        current_log_weights,
+        current_log_p_theta_cumulative,
+        current_log_psi_cumulative,
+        current_log_z_hat,
+    ) = initialize_particles_and_state(text_prompt_tokens, num_particles, device)
+
+    log_psi_incremental_selected_record = [[] for _ in range(num_particles)] if record_log_psi_incrementals else None
+    assert num_particles > 0, "SMC called with zero particles."
     
-    For each particle:
-      - Compute base logits from the model given its current sequence.
-      - Convert logits to probabilities.
-      - Compute twist scores and form a twisted proposal distribution.
-      - Sample the next token from the proposal distribution.
-      - Return the normalization constant for this step.
-    
-    Args:
-        particles (list[list[int]]): Current sequences (each particle is a list of token indices).
-        model (callable): Function that given a sequence returns logits for the next token.
-                           Expected output: torch.Tensor of shape (vocab_size,).
-        twist (callable): Function that given a list of particles returns twist scores.
-                          Expected output: torch.Tensor of shape (num_particles, vocab_size).
-        device (torch.device): Device for tensor computations.
-        logger: Optional logger instance
+    for t in range(new_tokens_count):
+        logger.debug(f"SMC Step {t+1}/{new_tokens_count}. Particle sequences shape: {current_particle_sequences.shape}")
         
-    Returns:
-        new_particles (list[list[int]]): Updated particles with the newly sampled token appended.
-        norm_constants (torch.Tensor): Normalization constants Z_t for each particle (shape: (num_particles,)).
-    """
-    if logger:
-        logger.debug(f"Sampling next token for {len(particles)} particles")
-    
-    num_particles = len(particles)
-    # Compute base logits for each particle and stack them to form a batch tensor.
-    batch_logits = []
-    for seq in particles:
-        logits = model(seq)  # Expected shape: (vocab_size,)
-        batch_logits.append(logits)
-    batch_logits = torch.stack(batch_logits, dim=0).to(device)
-    
-    if logger:
-        logger.debug(f"Computed base logits of shape {batch_logits.shape}")
-    
-    # Compute base probabilities.
-    base_prob = torch.softmax(batch_logits, dim=-1)  # Shape: (num_particles, vocab_size)
-    
-    # Get twist scores for the current particles.
-    psi = twist(particles).to(device)  # Expected shape: (num_particles, vocab_size)
-    
-    if logger:
-        logger.debug(f"Computed twist scores of shape {psi.shape}")
-    
-    # Form the twisted (unnormalized) proposal distribution.
-    twisted = base_prob * psi  # Elementwise multiplication.
-    
-    # Compute the normalization constant Z_t for each particle.
-    norm_constants = twisted.sum(dim=-1) + 1e-10  # Shape: (num_particles,)
-    
-    # Normalize to obtain the proposal distribution.
-    proposal = twisted / norm_constants.unsqueeze(-1)  # Shape: (num_particles, vocab_size)
-    
-    # Sample one token per particle from the categorical proposal.
-    new_particles = []
-    step_log_psi = []
-    for i in range(num_particles):
-        token = torch.multinomial(proposal[i], 1)  # Sample one token.
-        new_seq = particles[i] + [token.item()]
-        new_particles.append(new_seq)
+        previous_log_weights = current_log_weights.clone()
+
+        log_p_incremental_all_vocab = model_forward_fn(current_particle_sequences)
+        log_psi_incremental_all_vocab = twist_forward_fn(current_particle_sequences)
         
-        if record_log_psi:                                 
-            log_psi_val = torch.log(
-                torch.clamp(psi[i, token], min=1e-8)
-            ).squeeze()          # scalar
-            step_log_psi.append(log_psi_val)
-            
-    if record_log_psi:                                     
-        log_psi_record.append(step_log_psi)
-    
-    if logger:
-        logger.debug(f"Sampled next tokens, new particles length: {len(new_particles[0])}")
-    
-    return new_particles, norm_constants
+        # Ensure shapes are (num_particles, vocab_size)
+        assert log_p_incremental_all_vocab.ndim == 2 and log_p_incremental_all_vocab.shape[0] == num_particles, f"log_p shape error: {log_p_incremental_all_vocab.shape}"
+        assert log_psi_incremental_all_vocab.ndim == 2 and log_psi_incremental_all_vocab.shape[0] == num_particles, f"log_psi shape error: {log_psi_incremental_all_vocab.shape}"
+
+        log_q_unnormalized_all_vocab = log_p_incremental_all_vocab + log_psi_incremental_all_vocab
+        log_proposal_norm_const_at_t = torch.logsumexp(log_q_unnormalized_all_vocab, dim=-1, keepdim=True)
+        log_q_normalized_all_vocab = log_q_unnormalized_all_vocab - log_proposal_norm_const_at_t
+
+        proposal_probs = torch.exp(log_q_normalized_all_vocab)
+        proposal_probs = torch.clamp(proposal_probs, min=1e-20, max=1.0)  # for numerical stability
+
+        logger.debug(f"Proposal probs shape: {proposal_probs.shape}")
+        logger.debug(f"Proposal probs: {proposal_probs}")
+        try:
+            sampled_token_indices = torch.multinomial(proposal_probs, 1)
+        except Exception as e:
+            logger.error(f"Error sampling token indices: {e}")
+            logger.error(f"Proposal probs: {proposal_probs}")
+            raise e
+        current_particle_sequences = torch.cat((current_particle_sequences, sampled_token_indices), dim=1)
+
+        log_p_incremental_selected = log_p_incremental_all_vocab.gather(-1, sampled_token_indices).squeeze(-1)
+        log_psi_incremental_selected = log_psi_incremental_all_vocab.gather(-1, sampled_token_indices).squeeze(-1)
+        log_q_normalized_selected = log_q_normalized_all_vocab.gather(-1, sampled_token_indices).squeeze(-1)
+
+        current_log_p_theta_cumulative = current_log_p_theta_cumulative + log_p_incremental_selected
+        current_log_psi_cumulative = current_log_psi_cumulative + log_psi_incremental_selected
+        
+        log_alpha_t = log_p_incremental_selected + log_psi_incremental_selected - log_q_normalized_selected
+        current_log_weights = previous_log_weights + log_alpha_t
+
+        log_sum_w_t = torch.logsumexp(current_log_weights, dim=0)
+        log_sum_w_t_minus_1 = torch.logsumexp(previous_log_weights, dim=0)
+        current_log_z_hat = current_log_z_hat + (log_sum_w_t - log_sum_w_t_minus_1)
+
+        logger.debug(f"  Step {t+1} Log Weights (first 5): {current_log_weights[:min(5, num_particles)].tolist()}")
+        logger.debug(f"  Step {t+1} Log Alpha_t (first 5): {log_alpha_t[:min(5, num_particles)].tolist()}")
+        logger.debug(f"  Step {t+1} Log Z_hat: {current_log_z_hat.item():.4f}")
+
+        if record_log_psi_incrementals:
+            for i in range(num_particles):
+                log_psi_incremental_selected_record[i].append(log_psi_incremental_selected[i].detach()) # Detach for CTL
+
+        ess = compute_effective_sample_size(current_log_weights, logger)
+        if ess < num_particles / 2 and (t < new_tokens_count - 1):
+            logger.info(f"  Step {t+1}: ESS {ess.item():.2f} < {num_particles / 2}. Resampling.")
+            (
+                current_particle_sequences,
+                current_log_weights,
+                current_log_p_theta_cumulative,
+                current_log_psi_cumulative,
+                log_psi_incremental_selected_record,
+                _
+            ) = resample_particles_and_state(
+                current_particle_sequences,
+                current_log_weights,
+                current_log_p_theta_cumulative,
+                current_log_psi_cumulative,
+                device,
+                log_psi_incremental_selected_record,
+                logger,
+            )
+        elif logger:
+             logger.debug(f"  Step {t+1}: ESS {ess.item():.2f} >= {num_particles / 2}. No resampling.")
+
+    logger.info(f"SMC sampling completed in {time.time() - start_time:.2f} seconds")
+    logger.info(f"Final Log Z_hat: {current_log_z_hat.item():.4f}")
+    if num_particles > 0:
+        logger.info(f"Final Log Weights (mean): {current_log_weights.mean().item():.4f}")
+
+    return (
+        current_particle_sequences, # Now a tensor
+        current_log_weights,
+        log_psi_incremental_selected_record,
+        current_log_z_hat
+    )
+
 
 def compute_effective_sample_size(weights, logger=None):
     """
@@ -114,24 +214,44 @@ def compute_effective_sample_size(weights, logger=None):
     ESS = (sum(weights)^2) / sum(weights^2)
     
     Args:
-        weights (torch.Tensor): Tensor of particle weights.
+        weights (torch.Tensor): Tensor of particle weights. Can be log-weights or normal weights.
+                                If log-weights, they are converted to normal weights first.
         logger: Optional logger instance
         
     Returns:
         ess (float): The effective sample size.
     """
-    ess = (weights.sum() ** 2) / (weights ** 2).sum()
+    # If weights are log-weights, convert to normal scale for ESS calculation.
+    # A common heuristic is to check if most weights are <= 0.
+    if torch.all(weights <= 0):  # Heuristic for log-weights
+        max_log_weight = weights.max()
+        weights_normalized = torch.exp(weights - max_log_weight)  # Subtract max for numerical stability
+    else:
+        weights_normalized = weights
+
+    # Ensure weights are not all zero to avoid division by zero.
+    # If sum of squares is zero, it means all weights are zero.
+    sum_sq_weights = (weights_normalized ** 2).sum()
+    if sum_sq_weights == 0:
+        if logger:
+            logger.warning("ESS calculation: All weights are zero. Returning ESS of 0.")
+        return torch.tensor(0.0, device=weights.device)
+        
+    ess = (weights_normalized.sum() ** 2) / sum_sq_weights
     
     if logger:
         logger.debug(f"Computed ESS: {ess.item():.2f}")
     
     return ess
 
+
 def resample_particles(particles, weights, device, logger=None):
     """
     Resample particles based on their weights to prevent weight degeneracy.
     
     Particles are resampled in proportion to their weights, and the weights are reset to one.
+    This function assumes `particles` is a list of lists. 
+    If `particles` becomes a tensor, this function will need an update.
     
     Args:
         particles (list[list[int]]): Current particles.
@@ -156,69 +276,3 @@ def resample_particles(particles, weights, device, logger=None):
         logger.debug("Resampling complete")
     
     return resampled_particles, new_weights, indices
-
-def smc_proposal_sampling(text_prompt, model, twist, num_particles, new_tokens_count, device, logger=None, record_log_psi=False):
-    """
-    Perform SMC-PROPOSAL sampling starting from a given text prompt.
-    
-    The algorithm generates new tokens sequentially, updating particle weights using
-    normalization constants from the twisted proposal distribution. If the effective
-    sample size falls below a threshold, particles are resampled.
-    
-    Args:
-        text_prompt (list[int]): Initial sequence of token indices (text prompt).
-        model (callable): Function that given a sequence returns logits for the next token.
-                          Expected output for each call: torch.Tensor of shape (vocab_size,).
-        twist (callable): Function that given a list of particles returns twist scores.
-                          Expected output: torch.Tensor of shape (num_particles, vocab_size).
-        num_particles (int): Number of particles to maintain.
-        new_tokens_count (int): Number of new tokens to generate (i.e., generation steps beyond the prompt).
-        device (torch.device): Device for tensor computations.
-        logger: Optional logger instance
-        
-    Returns:
-        particles (list[list[int]]): Final sequences (each a list of token indices).
-        weights (torch.Tensor): Final importance weights for each particle.
-    """
-    if logger:
-        logger.info(f"Starting SMC sampling with {num_particles} particles")
-        start_time = time.time()
-    
-    # Initialize particles with the text prompt.
-    particles, weights = initialize_particles(text_prompt, num_particles, device, logger)
-    if record_log_psi:
-        # outer list over time; each element filled inside sample_next_token
-        log_psi_record = []
-        
-    # Generate new tokens sequentially.
-    for t in range(new_tokens_count):
-        if logger:
-            logger.debug(f"Generating token {t+1}/{new_tokens_count}")
-        
-        # Sample the next token for each particle.
-        particles, norm_constants = sample_next_token(particles, model, twist, device, logger, record_log_psi=record_log_psi,     # NEW
-            log_psi_record=log_psi_record)
-        
-        # Update the weights by multiplying with the normalization constants.
-        weights = weights * norm_constants
-        
-        # Optionally perform resampling if the effective sample size (ESS) is too low.
-        ess = compute_effective_sample_size(weights, logger)
-        if ess < num_particles / 2:
-            if logger:
-                logger.debug(f"ESS {ess.item():.2f} below threshold, resampling")
-            particles, weights, indices = resample_particles(particles, weights, device, logger)
-            if record_log_psi:
-                log_psi_record = [log_psi_record[i.item()] for i in indices]
-    
-    if record_log_psi:
-        # transpose so that log_psi_record[k][t]  (particle k, step t)
-        log_psi_record = list(map(list, zip(*log_psi_record)))
-        
-    if logger:
-        logger.info(f"SMC sampling completed in {time.time() - start_time:.2f} seconds")
-    
-    if record_log_psi:                           # NEW
-        return particles, weights, log_psi_record
-    else:
-        return particles, weights

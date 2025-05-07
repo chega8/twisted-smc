@@ -72,16 +72,20 @@ def compute_binary_cross_entropy_loss(logits, targets, logger=None):
     
     return loss
 
+
 def calculate_CTL_loss(rewards, weights, particles, log_psi_record, device):
     """Build CTL loss"""
-    baseline = rewards.mean() 
+    baseline = rewards.mean()
     loss = torch.tensor(0.0, device=device)
+    weights = torch.exp(weights)
     norm_w = weights / weights.sum()
     for k in range(len(particles)):
         # sum_{t} log psi_t for particle k   (already a list of scalars)
         logsum = torch.stack(log_psi_record[k]).sum()
         loss += -norm_w[k] * (rewards[k] - baseline) * logsum
     loss = loss / len(particles)
+    return loss
+
 
 def train_twist_for_math_problems(
     model_name: str,
@@ -143,63 +147,59 @@ def train_twist_for_math_problems(
         for i, example in enumerate(dataset):
             if i >= num_examples:
                 break
+            
+            for j in range(twist_updates_per_example):
+                if logger:
+                    logger.info(f"Processing example {i + 1}/{num_examples}")
+            
+                # Create prompt
+                prompt = create_math_prompt(example["question"])
+                prompt_tokens = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
                 
-            if logger:
-                logger.info(f"Processing example {i + 1}/{num_examples}")
-            
-            # Create prompt
-            prompt = create_math_prompt(example["question"])
-            prompt_tokens = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
-            
-            if logger:
-                logger.debug(f"Prompt: {prompt}")
-                logger.debug(f"Prompt tokens shape: {prompt_tokens.shape}")
-            
-            # Generate samples using SMC
-            particles, weights, log_psi_record = smc_proposal_sampling(
-                prompt_tokens[0].tolist(),
-                model.get_base_model_logits_for_sequence,
-                model.get_twist_values_for_particles,
-                num_twist_samples,
-                output_length,
-                device,
-                logger,
-                record_log_psi=True 
-            )
-            
-            if logger:
-                logger.debug(f"Generated {len(particles)} particles")
-            
-            # Calculate rewards for each particle
-            rewards = []
-            for particle in particles:
-                response = model.tokenizer.decode(particle[len(prompt_tokens[0]):], skip_special_tokens=True)
-                reward = calculate_reward(
-                    response,
-                    example['answer'],
-                    model.tokenizer,
-                    logger
+                if logger:
+                    logger.debug(f"Prompt: {prompt}")
+                    logger.debug(f"Prompt tokens shape: {prompt_tokens.shape}")
+                
+                # Generate samples using the aligned SMC
+                final_particles_sequences, final_log_weights, log_psi_incremental_record, log_z_hat = smc_proposal_sampling(
+                    prompt_tokens,
+                    model.get_base_model_logits_for_sequence,  # function for p(s_t|s_{1:t-1})
+                    model.get_twist_values_for_particles,      # function for psi_t(s_t|s_{1:t-1})
+                    num_twist_samples,
+                    output_length,
+                    device,
+                    logger,
+                    record_log_psi_incrementals=True  # Essential for CTL loss
                 )
-                rewards.append(reward)
-            
-            rewards = torch.tensor(rewards, device=device)
-            
-            if logger:
-                logger.debug(f"Rewards: {rewards.tolist()}")
-            
-            # Compute loss
-            # loss = compute_binary_cross_entropy_loss(weights, rewards, logger)
 
-            loss = calculate_CTL_loss(rewards, weights, particles, log_psi_record, device)
-            
-            if logger:
-                # logger.info(f"Loss: {loss.item():.4f}")
-                logger.info(f"CTL loss: {loss.item():.4f}  |  rewards: {rewards.tolist()}")
-            
-            # Backward pass
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+                if logger:
+                    logger.debug(f"  SMC generated {len(final_particles_sequences)} particles.")
+
+                rewards = []
+                for particle_seq_tokens in final_particles_sequences:
+                    # Decode only the generated part (after prompt)
+                    response_tokens = particle_seq_tokens[len(prompt_tokens):]
+                    response_text = model.tokenizer.decode(response_tokens, skip_special_tokens=True)
+                    reward_val = calculate_reward(response_text, example['answer'], model.tokenizer, logger)
+                    rewards.append(reward_val)
+                rewards_tensor = torch.tensor(rewards, device=device, dtype=torch.float)
+
+                if logger:
+                    logger.debug(f"  Rewards calculated (first 5): {rewards_tensor[:5].tolist()}")
+
+                loss = calculate_CTL_loss(rewards=rewards_tensor,
+                                          weights=final_log_weights,
+                                          particles=final_particles_sequences,
+                                          log_psi_record=log_psi_incremental_record,
+                                          device=device)
+
+                # Backward pass
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+                if logger:
+                    logger.info(f"  Example {i+1} - Loss: {loss.item():.4f} | Est. Log Z: {log_z_hat.item():.4f}")
             
             # Save checkpoint
             if (i + 1) % save_every == 0:
@@ -216,3 +216,27 @@ def train_twist_for_math_problems(
     
     if logger:
         logger.info(f"Training completed in {time.time() - start_time:.2f} seconds") 
+
+
+if __name__ == '__main__':
+    # Configure logger for detailed output when running standalone
+    logger = logging.getLogger('training')
+    logger.setLevel(logging.DEBUG)
+    ch = logging.StreamHandler()
+    ch.setLevel(logging.DEBUG)
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    ch.setFormatter(formatter)
+    if not logger.hasHandlers():
+        logger.addHandler(ch)
+    logger.propagate = False
+
+    train_twist_for_math_problems(
+        model_name="gpt2",
+        num_examples=2,       # Number of math problems to train on
+        num_epochs=1,         # Number of passes through the dataset
+        output_length=5,      # Number of tokens to generate per problem
+        num_twist_samples=8,  # Number of particles in SMC
+        learning_rate=5e-5,
+        logger=logger
+    )
+    print("Test run finished. Check logs for output.")
