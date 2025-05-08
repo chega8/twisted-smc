@@ -43,7 +43,7 @@ class ModelWrapper:
         input_ids = torch.tensor(sequence, device=self.device).unsqueeze(0)
         with torch.no_grad():
             outputs = self.base_model(input_ids=input_ids, return_dict=True)
-            return outputs.logits[0, -1, :]
+            return outputs.logits.squeeze(0)[:, -1, :]  # NOTE: now may fail for single particle run
     
     def get_twist_values_for_particles(self, particles):
         """Get twist values for a list of particles."""
