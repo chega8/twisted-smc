@@ -1,15 +1,14 @@
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from datasets import load_dataset
 import time
 import logging
 import os
-
-# Change relative imports to absolute imports
+import torch
+import torch.nn as nn
+from datasets import load_dataset
+from jaxtyping import Float, Int
 from model import ModelWrapper
 from rewards import calculate_reward
 from smc_sampling import smc_proposal_sampling
+
 
 def create_math_prompt(question, logger=None):
     """
@@ -64,16 +63,22 @@ def compute_binary_cross_entropy_loss(logits, targets, logger=None):
     """
     if logger:
         logger.debug(f"Computing BCE loss for logits shape {logits.shape}, targets shape {targets.shape}")
-    
+
     loss = nn.BCEWithLogitsLoss()(logits, targets)
-    
+
     if logger:
         logger.debug(f"Computed loss: {loss.item():.4f}")
-    
+
     return loss
 
 
-def calculate_CTL_loss(rewards, weights, particles, log_psi_record, device):
+def calculate_CTL_loss(
+    rewards: Float[torch.Tensor, "num_particles"],
+    weights: Float[torch.Tensor, "num_particles"],
+    particles: Int[torch.Tensor, "num_particles seq_len"],
+    log_psi_record: Float[torch.Tensor, "new_tokens_count num_particles"],
+    device: torch.device,
+):
     """Build CTL loss"""
     baseline = rewards.mean()
     loss = torch.tensor(0.0, device=device)
@@ -81,8 +86,8 @@ def calculate_CTL_loss(rewards, weights, particles, log_psi_record, device):
     norm_w = weights / weights.sum()
     for k in range(len(particles)):
         # sum_{t} log psi_t for particle k   (already a list of scalars)
-        logsum = torch.stack(log_psi_record[k]).sum()
-        loss += -norm_w[k] * (rewards[k] - baseline) * logsum
+        logsum_psi = log_psi_record[:, k].sum()
+        loss += -norm_w[k] * (rewards[k] - baseline) * logsum_psi
     loss = loss / len(particles)
     return loss
 
@@ -97,7 +102,7 @@ def train_twist_for_math_problems(
     seed: int = 42,
     split: str = "train",
     output_length: int = 200,
-    num_twist_samples: int = 4,
+    num_particles: int = 4,
     twist_updates_per_example: int = 1,
     save_every: int = 5,
     logger = None
@@ -115,7 +120,7 @@ def train_twist_for_math_problems(
         seed: Random seed
         split: Dataset split to use
         output_length: Length of output sequences
-        num_twist_samples: Number of twist samples
+        num_particles: Number of particles in SMC (samples in a batch over which we jointly optimize)
         twist_updates_per_example: Number of twist updates per example
         save_every: Save checkpoint every N examples
         logger: Optional logger instance
@@ -154,7 +159,9 @@ def train_twist_for_math_problems(
             
                 # Create prompt
                 prompt = create_math_prompt(example["question"])
-                prompt_tokens = model.tokenizer.encode(prompt, return_tensors="pt").to(device)
+                
+                # always using 1 prompts - hence can squeeze batch dimension
+                prompt_tokens: Float[torch.Tensor, "seq_len"] = model.tokenizer.encode(prompt, return_tensors="pt").to(device).squeeze(0)
                 
                 if logger:
                     logger.debug(f"Prompt: {prompt}")
@@ -162,13 +169,13 @@ def train_twist_for_math_problems(
                 
                 # Generate samples using the aligned SMC
                 final_particles_sequences, final_log_weights, log_psi_incremental_record, log_z_hat = smc_proposal_sampling(
-                    prompt_tokens,
-                    model.get_base_model_logits_for_sequence,  # function for p(s_t|s_{1:t-1})
-                    model.get_twist_values_for_particles,      # function for psi_t(s_t|s_{1:t-1})
-                    num_twist_samples,
-                    output_length,
-                    device,
-                    logger,
+                    text_prompt_tokens=prompt_tokens,
+                    model_forward_fn=model.get_base_model_logits_for_sequence,  # function for p(s_t|s_{1:t-1}) that return log_p
+                    twist_forward_fn=model.get_twist_values_for_particles,      # function for psi_t(s_t|s_{1:t-1}) that returns psi (not log_psi!)
+                    num_particles=num_particles,
+                    new_tokens_count=output_length,
+                    device=device,
+                    logger_instance=logger,
                     record_log_psi_incrementals=True  # Essential for CTL loss
                 )
 
@@ -234,8 +241,8 @@ if __name__ == '__main__':
         model_name="gpt2",
         num_examples=2,       # Number of math problems to train on
         num_epochs=1,         # Number of passes through the dataset
-        output_length=5,      # Number of tokens to generate per problem
-        num_twist_samples=8,  # Number of particles in SMC
+        output_length=11,     # Number of tokens to generate per problem
+        num_particles=8,  # Number of particles in SMC
         learning_rate=5e-5,
         logger=logger
     )

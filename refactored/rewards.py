@@ -193,7 +193,6 @@ def calculate_reward(sample_text, correct_answer, tokenizer=None, logger=None):
             logger.debug(f"Reward components: {reward_components}")
 
     
-        
     except Exception as e:
         if logger:
             logger.error(f"ERROR in calculate_reward: {e}")
