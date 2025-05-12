@@ -98,3 +98,55 @@ def log_time(logger, start_time, message, level=logging.INFO):
     elapsed = time.time() - start_time
     logger.log(level, f"{message}: {elapsed:.2f} seconds")
     return time.time()  # Return current time for chaining 
+
+
+# utils/log_plot.py
+import csv, pathlib, matplotlib.pyplot as plt
+
+class TrainLogger:
+    """Light-weight metric logger + png plotter."""
+    def __init__(self, out_dir: str):
+        self.out_dir   = pathlib.Path(out_dir)
+        self.csv_path  = self.out_dir / "train_metrics.csv"
+        self.out_dir.mkdir(parents=True, exist_ok=True)
+
+        self.step      = []
+        self.metrics   = {}              # name -> list
+
+        # create csv header
+        with self.csv_path.open("w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["step"])    # we'll append metric names lazily
+
+    def log(self, step: int, **kwargs):
+        """
+        Example:  logger.log(step=i, loss=loss.item(), logZ=log_z.item())
+        """
+        if not self.metrics:             # first call → init lists / header
+            for k in kwargs: self.metrics[k] = []
+            with self.csv_path.open("r+", newline="") as f:
+                lines = list(csv.reader(f))
+                lines[0].extend(kwargs.keys())
+                f.seek(0); f.truncate()
+                csv.writer(f).writerows(lines)
+
+        self.step.append(step)
+        for k, v in kwargs.items():
+            self.metrics[k].append(float(v))   # ensure JSON-serialisable
+
+        # append row to CSV
+        with self.csv_path.open("a", newline="") as f:
+            row = [step] + [kwargs[k] for k in self.metrics]
+            csv.writer(f).writerow(row)
+
+    # call once at the very end
+    def plot_all(self):
+        for k, vals in self.metrics.items():
+            plt.figure()
+            plt.plot(self.step, vals)
+            plt.xlabel("step")
+            plt.ylabel(k)
+            plt.title(k)
+            plt.tight_layout()
+            plt.savefig(self.out_dir / f"{k}.png")
+            plt.close()

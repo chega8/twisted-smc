@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import time
+import math
+
 
 class TwistModel(nn.Module):
     """
@@ -23,6 +25,81 @@ class TwistModel(nn.Module):
         h        = self.embed(last_ids)      # (B, hidden)
         return self.head(h) 
 
+
+class PositionalEncoding(nn.Module):
+    """
+    Standard sine-cosine pos-enc (same as GPT) for any hidden_dim.
+    """
+    def __init__(self, hidden_dim: int, max_len: int = 2048):
+        super().__init__()
+        pe = torch.zeros(max_len, hidden_dim)
+        pos = torch.arange(0, max_len).unsqueeze(1)
+        div = torch.exp(torch.arange(0, hidden_dim, 2) *
+                        (-math.log(10000.0) / hidden_dim))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer("pe", pe)   # (max_len, H)
+
+    def forward(self, x):                # x: (B,L,H)
+        return x + self.pe[: x.size(1)]
+
+
+class TransformerTwistModel(nn.Module):
+    """
+    Tiny causal Transformer that outputs log-ψ_t for every vocab token.
+    Memory footprint: O(B·L·H) with H ≪ base-LM hidden size (e.g. 128).
+    """
+    def __init__(
+        self,
+        vocab_size: int,
+        hidden_dim: int = 128,
+        n_layers: int = 1,
+        n_heads: int = 4,
+        dropout: float = 0.1,
+        max_len: int = 1024,
+    ):
+        super().__init__()
+        self.embed = nn.Embedding(vocab_size, hidden_dim)
+
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_dim,
+            nhead=n_heads,
+            dim_feedforward=hidden_dim * 4,
+            dropout=dropout,
+            activation="gelu",
+            batch_first=True,
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=n_layers
+        )
+
+        self.pos_enc = PositionalEncoding(hidden_dim, max_len)
+        self.head = nn.Linear(hidden_dim, vocab_size)
+
+        # initialise near-zero so ψ ≈ 1 at start
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        """
+        input_ids: (B, L)  – prefix tokens
+        returns   : (B, V) – log-ψ for each next-token candidate
+        """
+        B, L = input_ids.shape
+        x = self.embed(input_ids)                # (B, L, H)
+        x = self.pos_enc(x)
+
+        # causal mask so token t sees ≤ t
+        causal_mask = torch.triu(
+            torch.full((L, L), float("-inf"), device=x.device), diagonal=1
+        )
+        h = self.transformer(x, mask=causal_mask)   # (B, L, H)
+
+        last_hidden = h[:, -1, :]                # (B, H)
+        log_psi = self.head(last_hidden)         # (B, V)
+        return log_psi
+
+
 class ModelWrapper:
     def __init__(self, model_name, device=None, logger=None):
         self.logger = logger
@@ -33,7 +110,11 @@ class ModelWrapper:
         
         self.tokenizer = AutoTokenizer.from_pretrained(model_name)
         self.base_model = AutoModelForCausalLM.from_pretrained(model_name).to(self.device)
-        self.twist_model = TwistModel(self.tokenizer.vocab_size).to(self.device)
+        # self.twist_model = TwistModel(self.tokenizer.vocab_size).to(self.device)
+        self.twist_model = TransformerTwistModel(self.tokenizer.vocab_size).to(self.device)
+        for p in self.twist_model.parameters():
+            p.requires_grad = True
+
         
         if logger:
             logger.info(f"Model loaded with vocab size: {self.tokenizer.vocab_size}")
@@ -43,7 +124,7 @@ class ModelWrapper:
         input_ids = torch.tensor(sequence, device=self.device).unsqueeze(0)
         with torch.no_grad():
             outputs = self.base_model(input_ids=input_ids, return_dict=True)
-            return outputs.logits[0, -1, :]
+            return outputs.logits.squeeze(0)[:, -1, :]  # NOTE: now may fail for single particle run
     
     def get_twist_values_for_particles(self, particles):
         """Get twist values for a list of particles."""

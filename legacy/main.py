@@ -322,7 +322,7 @@ def train(rng_key, prompt, params_p, params_twist, log_true_final_twist, output_
             # Try with additional parameters
             try:
                 # Try with prompt and tokenizer
-                from train_gemma2 import AutoTokenizer
+                from legacy.train_gemma2 import AutoTokenizer
                 tokenizer = AutoTokenizer.from_pretrained("google/gemma-2b-it")
                 prompt_text = "Solve this math problem: 2 + 2 = ?"
                 answer = "4"
@@ -425,7 +425,7 @@ def log_true_final_twist(samples, condition_twist_on_tokens=None, reward_model=N
     
     # Import the calculate_reward function from train_gemma2
     try:
-        from train_gemma2 import calculate_reward as gsm8k_calculate_reward
+        from legacy.train_gemma2 import calculate_reward as gsm8k_calculate_reward
         print("Using GSM8K calculate_reward function")
         
         # Create a dummy tokenizer for now - this will be replaced by the actual tokenizer

@@ -11,7 +11,7 @@ import os
 import json
 from tqdm import tqdm
 import argparse
-from main import (
+from legacy.main import (
     stochastic_transformer_sample,
     evaluate_log_psi_selected_tokens,
     binary_cross_entropy,
